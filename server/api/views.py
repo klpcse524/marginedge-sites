@@ -1,57 +1,33 @@
-from django.contrib.auth import authenticate, get_user_model
-from django.contrib.auth.models import update_last_login
+# api/views.py
+from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import make_password
-from rest_framework import viewsets, status
+from rest_framework import viewsets, status, serializers
 from rest_framework.decorators import api_view, permission_classes, authentication_classes
-from rest_framework.authentication import TokenAuthentication
-from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework_simplejwt.tokens import RefreshToken
-from rest_framework.authtoken.models import Token
-from django.http import JsonResponse
-from django.views.decorators.csrf import csrf_exempt
-from functools import wraps
-from .models import CustomUser, Order, Invoice, Vendor, Restaurant
-from .serializers import CustomUserSerializer, OrderSerializer, InvoiceSerializer, VendorSerializer, UserSerializer, RestaurantSerializer
+from .models import CustomUser, Invoice, Vendor
+from .serializers import CustomUserSerializer, UserSerializer, InvoiceSerializer, VendorSerializer
 from rest_framework.parsers import MultiPartParser, FormParser
-from rest_framework.authtoken.views import ObtainAuthToken
 from rest_framework.views import APIView
-from .hybrid_invoice_extractor import extract_invoice_data_hybrid
 import json
 import logging
 from datetime import datetime
+from .hybrid_invoice_extractor import extract_invoice_data_hybrid
 
-class InvoiceView(APIView):
-    def get(self, request):
-        invoices = Invoice.objects.all()
-        serializer = InvoiceSerializer(invoices, many=True)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+logger = logging.getLogger(__name__)
 
-    def post(self, request):
-        serializer = InvoiceSerializer(data=request.data)
-        if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-def role_required(allowed_roles=[]):
-    def decorator(view_func):
-        @wraps(view_func)
-        def wrapper(request, *args, **kwargs):
-            if request.user.is_authenticated and request.user.role in allowed_roles:
-                return view_func(request, *args, **kwargs)
-            return JsonResponse({"error": "Unauthorized"}, status=403)
-        return wrapper
-    return decorator
-
+# -------------------------------
+# Authentication Endpoints
+# -------------------------------
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def login_view(request):
     email = request.data.get("email")
     password = request.data.get("password")
     try:
-        user = CustomUser.objects.get(email=email)
-    except CustomUser.DoesNotExist:
+        user = get_user_model().objects.get(email=email)
+    except get_user_model().DoesNotExist:
         return Response({"error": "Invalid credentials"}, status=status.HTTP_401_UNAUTHORIZED)
     if not user.check_password(password):
         return Response({"error": "Invalid credentials"}, status=status.HTTP_401_UNAUTHORIZED)
@@ -66,275 +42,152 @@ def login_view(request):
         }
     })
 
-@api_view(["POST"])
-@permission_classes([IsAuthenticated])
-@role_required(["superuser"])
-def create_restaurant(request):
-    data = request.data
-    name = data.get("name")
-    address = data.get("address")
-    if not name or not address:
-        return Response({"error": "Name and address are required."}, status=400)
-    restaurant = Restaurant.objects.create(name=name, address=address)
-    return Response({"message": "Restaurant created successfully.", "restaurant_id": restaurant.id})
-
-@api_view(["POST"])
-@permission_classes([IsAuthenticated])
-@role_required(["admin"])
-def register_user(request):
-    data = request.data
-    username = data.get("username")
-    email = data.get("email")
-    password = data.get("password")
-    role = data.get("role", "user")
-    restaurant_id = data.get("restaurant_id")
-    if not username or not email or not password or not restaurant_id:
-        return Response({"error": "All fields are required."}, status=400)
-    try:
-        restaurant = Restaurant.objects.get(id=restaurant_id)
-    except Restaurant.DoesNotExist:
-        return Response({"error": "Invalid restaurant ID."}, status=400)
-    user = CustomUser.objects.create(
-        username=username,
-        email=email,
-        password=make_password(password),
-        role=role,
-        restaurant=restaurant,
-    )
-    return Response({"message": "User registered successfully."}, status=201)
-
-class UserViewSet(viewsets.ModelViewSet):
-    queryset = CustomUser.objects.all()
-    serializer_class = UserSerializer
+class CustomUserViewSet(viewsets.ModelViewSet):
+    queryset = get_user_model().objects.all()
+    serializer_class = CustomUserSerializer
     permission_classes = [IsAuthenticated]
 
-class RestaurantViewSet(viewsets.ModelViewSet):
-    queryset = Restaurant.objects.all()
-    serializer_class = RestaurantSerializer
-    permission_classes = [IsAuthenticated]
-
+# -------------------------------
+# Vendor Endpoints
+# -------------------------------
 class VendorViewSet(viewsets.ModelViewSet):
-    queryset = Vendor.objects.all().order_by('-created_at')
+    queryset = Vendor.objects.all().order_by('-id')
     serializer_class = VendorSerializer
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
 
-class CustomUserViewSet(viewsets.ModelViewSet):
-    queryset = CustomUser.objects.all()
-    serializer_class = CustomUserSerializer
-
-class OrderViewSet(viewsets.ModelViewSet):
-    queryset = Order.objects.all()
-    serializer_class = OrderSerializer
-
+# -------------------------------
+# Invoice Endpoints
+# -------------------------------
 class InvoiceViewSet(viewsets.ModelViewSet):
     queryset = Invoice.objects.all().order_by('-created_at')
     serializer_class = InvoiceSerializer
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
 
-    def create(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop("partial", False)
+        instance = self.get_object()
 
-class CustomAuthToken(ObtainAuthToken):
-    def post(self, request, *args, **kwargs):
-        serializer = self.serializer_class(data=request.data, context={'request': request})
+        # Check if vendor_name is provided in the request data.
+        vendor_name = request.data.get("vendor_name")
+        if vendor_name and instance.vendor:
+            # Update the vendor record.
+            instance.vendor.vendor_name = vendor_name
+            instance.vendor.save()
+
+        # Remove vendor_name from the request data so it doesn't conflict with the read-only field.
+        mutable_data = request.data.copy()
+        if "vendor_name" in mutable_data:
+            mutable_data.pop("vendor_name")
+
+        serializer = self.get_serializer(instance, data=mutable_data, partial=partial)
         serializer.is_valid(raise_exception=True)
-        user = serializer.validated_data['user']
-        token, created = Token.objects.get_or_create(user=user)
-        return Response({'token': token.key})
+        self.perform_update(serializer)
 
-# New pending_invoices endpoint:
+        # Optionally, update vendor totals.
+        if instance.vendor:
+            instance.vendor.update_totals()
+
+        return Response(serializer.data)
+
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def pending_invoices(request):
-    invoices = Invoice.objects.filter(status="Pending Review")
+    invoices = Invoice.objects.filter(status="Pending for review")
     serializer = InvoiceSerializer(invoices, many=True)
     return Response(serializer.data)
 
-logger = logging.getLogger(__name__)
+# -------------------------------
+# Invoice File Upload Endpoint
+# -------------------------------
+def process_invoice_file(invoice_file):
+    """
+    Placeholder function for processing the invoice file.
+    Replace this with your actual OCR/NER/NLP logic.
+    It should return a dictionary containing both vendor and invoice details.
+    """
+    return {
+        'vendor_name': 'Demo Vendor',
+        'account_number': '123456',
+        'items_supplied': 'Item A, Item B',
+        'category': 'Office Supplies',
+        'address_line_1': '123 Main St',
+        'address_line_2': '',
+        'city': 'Anytown',
+        'state': 'State',
+        'zip_code': '12345',
+        'contact_email': 'vendor@example.com',
+        'contact_phone': '555-1234',
+        'bank_account_number': '987654321',
+        'routing_number': '111000',
+        'bank_name': 'Demo Bank',
+        'account_payee': 'Demo Vendor Payee',
+        'invoice_number': 'INV-001',
+        'invoice_date': datetime.today().date(),
+        'amount': 100.00,
+        'status': 'Pending for review',
+    }
 
 class InvoiceUploadView(APIView):
     parser_classes = [MultiPartParser, FormParser]
+    permission_classes = [IsAuthenticated]
 
     def post(self, request, *args, **kwargs):
-        auth_header = request.META.get('HTTP_AUTHORIZATION', '')
-        print("Received Authorization header:", auth_header)  # Debug: log header
-
-        file_obj = request.FILES.get('invoice_file')
-        if not file_obj:
-            return Response({"error": "No file uploaded."}, status=status.HTTP_400_BAD_REQUEST)
+        invoice_file = request.FILES.get('invoice_file')
+        if not invoice_file:
+            return Response({"error": "No file uploaded."}, status=400)
         try:
-            parsed_data = extract_invoice_data_hybrid(file_obj)
+            extracted = extract_invoice_data_hybrid(invoice_file)
         except Exception as e:
-            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({"error": str(e)}, status=500)
         
-        # (rest of your code...)
+        vendor_name = extracted.get("vendor_name")
+        if not vendor_name:
+            return Response({"error": "Vendor name not found in invoice."}, status=400)
         
-        # Reset the file pointer for saving.
-        file_obj.seek(0)
+        # Create or get vendor using the extracted vendor_name.
+        vendor, created = Vendor.objects.get_or_create(
+            vendor_name=vendor_name,
+            defaults={
+                "account_number": extracted.get("account_number"),
+                "items_supplied": extracted.get("items_supplied"),
+                "category": extracted.get("category"),
+                "address_line_1": extracted.get("address_line_1"),
+                "address_line_2": extracted.get("address_line_2"),
+                "city": extracted.get("city"),
+                "state": extracted.get("state"),
+                "zip_code": extracted.get("zip_code"),
+                "contact_email": extracted.get("contact_email"),
+                "contact_phone": extracted.get("contact_phone"),
+                "bank_account_number": extracted.get("bank_account_number"),
+                "routing_number": extracted.get("routing_number"),
+                "bank_name": extracted.get("bank_name"),
+                "account_payee": extracted.get("account_payee"),
+            }
+        )
         
-        vendor_name = parsed_data.get("vendor_name", "")[:255]
-        invoice_number = parsed_data.get("invoice_number", "")
-        
-        # Check for duplicate invoice using vendor name and invoice number.
-        existing_invoice = Invoice.objects.filter(
-            vendor__vendor_name__iexact=vendor_name,
-            invoice_number=invoice_number
-        ).first()
+        invoice_number = extracted.get("invoice_number")
+        # Check if an invoice with this vendor and invoice_number already exists.
+        existing_invoice = Invoice.objects.filter(vendor=vendor, invoice_number=invoice_number).first()
         if existing_invoice:
             return Response({
                 "message": "Invoice already existed.",
                 "invoice_id": existing_invoice.id
-            }, status=status.HTTP_200_OK)
+            }, status=200)
         
-        # Update or create Vendor record.
-        vendor = Vendor.objects.filter(vendor_name__iexact=vendor_name).first()
-        if vendor:
-            vendor.invoice_number = invoice_number
-            vendor.invoice_date = parsed_data.get("invoice_date", "1970-01-01")
-            vendor.amount = parsed_data.get("amount", "0.00")
-            vendor.invoice_file = file_obj
-            vendor.status = "Processing"
-            vendor.save()
-        else:
-            vendor = Vendor.objects.create(
-                vendor_name=vendor_name,
-                invoice_number=invoice_number,
-                invoice_date=parsed_data.get("invoice_date", "1970-01-01"),
-                amount=parsed_data.get("amount", "0.00"),
-                invoice_file=file_obj,
-                status="Pending Review",
-                is_validated=False
-            )
-        
-        # Reset file pointer again for invoice saving.
-        file_obj.seek(0)
-        
-        # Set invoice status based on vendor validation.
-        invoice_status = "Approved" if vendor.is_validated else "Pending Review"
-        
+        # Create the invoice record.
         invoice = Invoice.objects.create(
             vendor=vendor,
-            vendor_name=vendor.vendor_name,
-            invoice_number=vendor.invoice_number,
-            invoice_date=vendor.invoice_date,
-            amount=vendor.amount,
-            invoice_file=file_obj,
-            status=invoice_status,
+            invoice_number=invoice_number,
+            invoice_date=extracted.get("invoice_date"),
+            amount=extracted.get("amount"),
+            status=extracted.get("status", "Pending for review"),
+            invoice_file=invoice_file
         )
-        return Response({"message": "Invoice uploaded successfully.", "invoice_id": invoice.id}, status=status.HTTP_201_CREATED)
+        vendor.update_totals()
+        return Response({
+            "message": "Invoice uploaded successfully",
+            "invoice_id": invoice.id
+        }, status=201)
 
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def list_orders(request):
-    orders = Order.objects.all()
-    serializer = OrderSerializer(orders, many=True)
-    return Response(serializer.data)
-
-@api_view(['POST'])
-@permission_classes([IsAuthenticated])
-def create_order(request):
-    serializer = OrderSerializer(data=request.data)
-    if serializer.is_valid():
-        serializer.save()
-        return Response(serializer.data, status=201)
-    return Response(serializer.errors, status=400)
-
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def order_detail(request, order_id):
-    try:
-        order = Order.objects.get(order_id=order_id)
-        serializer = OrderSerializer(order)
-        return Response(serializer.data)
-    except Order.DoesNotExist:
-        return Response({'error': 'Order not found'}, status=404)
-
-@api_view(["GET"])
-@permission_classes([IsAuthenticated])
-def list_invoices(request):
-    invoices = Invoice.objects.all().order_by("-id")
-    serializer = InvoiceSerializer(invoices, many=True)
-    return Response(serializer.data)
-
-@api_view(["POST"])
-@permission_classes([IsAuthenticated])
-def create_invoice(request):
-    serializer = InvoiceSerializer(data=request.data)
-    if serializer.is_valid():
-        serializer.save()
-        return Response(serializer.data, status=201)
-    return Response(serializer.errors, status=400)
-
-@api_view(["POST"])
-@permission_classes([IsAuthenticated])
-def upload_invoice(request):
-    file = request.FILES.get("invoice_file")
-    if not file:
-        return Response({"error": "No file uploaded"}, status=status.HTTP_400_BAD_REQUEST)
-    invoice = Invoice.objects.create(invoice_file=file)
-    return Response({"message": "Invoice uploaded successfully", "file_url": invoice.invoice_file.url}, status=status.HTTP_201_CREATED)
-
-@api_view(["PUT"])
-@permission_classes([IsAuthenticated])
-def edit_invoice(request, invoice_id):
-    try:
-        invoice = Invoice.objects.get(id=invoice_id)
-    except Invoice.DoesNotExist:
-        return Response({"error": "Invoice not found"}, status=status.HTTP_404_NOT_FOUND)
-    
-    try:
-        data = json.loads(request.body)
-    except json.JSONDecodeError:
-        return Response({"error": "Invalid JSON payload."}, status=status.HTTP_400_BAD_REQUEST)
-
-    serializer = InvoiceSerializer(invoice, data=data, partial=True)
-    if serializer.is_valid():
-        serializer.save()
-        return Response(serializer.data)
-    else:
-        # Log the errors to help debug which fields are causing issues
-        print("Serializer errors:", serializer.errors)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-@api_view(["DELETE"])
-@permission_classes([IsAuthenticated])
-def delete_invoice(request, invoice_id):
-    try:
-        invoice = Invoice.objects.get(id=invoice_id)
-        invoice.delete()
-        return Response({"message": "Invoice deleted successfully"}, status=status.HTTP_204_NO_CONTENT)
-    except Invoice.DoesNotExist:
-        return Response({"error": "Invoice not found"}, status=status.HTTP_404_NOT_FOUND)
-
-@api_view(["GET"])
-@authentication_classes([TokenAuthentication])
-@permission_classes([IsAuthenticated])
-def get_invoices(request):
-    invoices = Invoice.objects.all()
-    serializer = InvoiceSerializer(invoices, many=True)
-    return Response(serializer.data)
-
-@api_view(["PUT"])
-@permission_classes([IsAuthenticated])
-def review_invoice(request, invoice_id):
-    try:
-        invoice = Invoice.objects.get(id=invoice_id)
-    except Invoice.DoesNotExist:
-        return Response({"error": "Invoice not found"}, status=status.HTTP_404_NOT_FOUND)
-    
-    data = json.loads(request.body)
-    serializer = InvoiceSerializer(invoice, data=data, partial=True)
-    if serializer.is_valid():
-        serializer.save()
-        vendor = invoice.vendor
-        if data.get("approved_vendor"):
-            vendor.is_validated = True
-            vendor.save()
-        return Response(serializer.data)
-    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
