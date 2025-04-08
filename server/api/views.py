@@ -129,6 +129,8 @@ def process_invoice_file(invoice_file):
         'status': 'Pending for review',
     }
 
+from django.db import IntegrityError
+
 class InvoiceUploadView(APIView):
     parser_classes = [MultiPartParser, FormParser]
     permission_classes = [IsAuthenticated]
@@ -137,57 +139,96 @@ class InvoiceUploadView(APIView):
         invoice_file = request.FILES.get('invoice_file')
         if not invoice_file:
             return Response({"error": "No file uploaded."}, status=400)
+        
         try:
+            # Extract data from invoice
             extracted = extract_invoice_data_hybrid(invoice_file)
-        except Exception as e:
-            return Response({"error": str(e)}, status=500)
-        
-        vendor_name = extracted.get("vendor_name")
-        if not vendor_name:
-            return Response({"error": "Vendor name not found in invoice."}, status=400)
-        
-        # Create or get vendor using the extracted vendor_name.
-        vendor, created = Vendor.objects.get_or_create(
-            vendor_name=vendor_name,
-            defaults={
-                "account_number": extracted.get("account_number"),
-                "items_supplied": extracted.get("items_supplied"),
-                "category": extracted.get("category"),
-                "address_line_1": extracted.get("address_line_1"),
-                "address_line_2": extracted.get("address_line_2"),
-                "city": extracted.get("city"),
-                "state": extracted.get("state"),
-                "zip_code": extracted.get("zip_code"),
-                "contact_email": extracted.get("contact_email"),
-                "contact_phone": extracted.get("contact_phone"),
-                "bank_account_number": extracted.get("bank_account_number"),
-                "routing_number": extracted.get("routing_number"),
-                "bank_name": extracted.get("bank_name"),
-                "account_payee": extracted.get("account_payee"),
-            }
-        )
-        
-        invoice_number = extracted.get("invoice_number")
-        # Check if an invoice with this vendor and invoice_number already exists.
-        existing_invoice = Invoice.objects.filter(vendor=vendor, invoice_number=invoice_number).first()
-        if existing_invoice:
+            
+            # Create or update vendor
+            vendor, created = Vendor.objects.get_or_create(
+                vendor_name=extracted['vendor_name'],
+                defaults={
+                    "account_number": extracted.get('account_number'),
+                    "contact_email": extracted.get('contact_email'),
+                    "contact_phone": extracted.get('contact_phone'),
+                    "address_line_1": extracted.get('address_line_1'),
+                    "address_line_2": extracted.get('address_line_2'),
+                    "city": extracted.get('city'),
+                    "state": extracted.get('state'),
+                    "zip_code": extracted.get('zip_code'),
+                    "bank_account_number": extracted.get('bank_account_number'),
+                    "routing_number": extracted.get('routing_number'),
+                    "bank_name": extracted.get('bank_name'),
+                    "account_payee": extracted.get('account_payee'),
+                    "category": self.determine_vendor_category(extracted['vendor_name'])
+                }
+            )
+            
+            # Check if an invoice with this vendor and invoice_number already exists (case-insensitive)
+            existing_invoice = Invoice.objects.filter(
+                vendor=vendor,
+                invoice_number__iexact=extracted['invoice_number']
+            ).first()
+            
+            if existing_invoice:
+                return Response({
+                "message": "Invoice already exists",
+                "invoice_id": existing_invoice.id,
+                "is_new": False
+                }, status=200)
+            
+            # Try to create the invoice
+            try:
+                invoice = Invoice.objects.create(
+                    vendor=vendor,
+                    invoice_number=extracted['invoice_number'],
+                    invoice_date=extracted['invoice_date'],
+                    amount=extracted['amount'],
+                    status="Pending for review",
+                    invoice_file=invoice_file
+                )
+            except IntegrityError:
+                # If a duplicate is raised, fetch the existing invoice and return it
+                existing_invoice = Invoice.objects.filter(
+                    vendor=vendor,
+                    invoice_number__iexact=extracted['invoice_number']
+                ).first()
+                if existing_invoice:
+                    return Response({
+                    "message": "Invoice already exists",
+                    "invoice_id": existing_invoice.id,
+                    "is_new": False
+                    }, status=200)
+                else:
+                    raise
+            
+            vendor.update_totals()
+            
             return Response({
-                "message": "Invoice already existed.",
-                "invoice_id": existing_invoice.id
-            }, status=200)
-        
-        # Create the invoice record.
-        invoice = Invoice.objects.create(
-            vendor=vendor,
-            invoice_number=invoice_number,
-            invoice_date=extracted.get("invoice_date"),
-            amount=extracted.get("amount"),
-            status=extracted.get("status", "Pending for review"),
-            invoice_file=invoice_file
-        )
-        vendor.update_totals()
-        return Response({
-            "message": "Invoice uploaded successfully",
-            "invoice_id": invoice.id
-        }, status=201)
+            "message": "Invoice processed successfully",
+            "invoice_id": invoice.id,
+            "is_new": True,
+            "extracted_data": extracted
+            }, status=201)
+            
+        except Exception as e:
+            logger.error(f"Invoice processing error: {str(e)}", exc_info=True)
+            return Response({
+                "error": "Failed to process invoice",
+                "details": str(e)
+            }, status=400)
+    
+    def determine_vendor_category(self, vendor_name):
+        """Simple heuristic to categorize vendors"""
+        vendor_name = vendor_name.lower()
+        categories = {
+            'food': ['meat', 'produce', 'dairy', 'seafood', 'bakery'],
+            'beverage': ['wine', 'beer', 'liquor', 'beverage'],
+            'supplies': ['paper', 'cleaning', 'chemical', 'uniform'],
+            'equipment': ['kitchen', 'appliance', 'repair']
+        }
+        for category, keywords in categories.items():
+            if any(keyword in vendor_name for keyword in keywords):
+                return category.capitalize()
+        return "Other"
 

@@ -25,7 +25,7 @@ class CustomUser(AbstractUser):
 # Vendor Model
 # -------------------------------
 class Vendor(models.Model):
-    vendor_name = models.CharField(max_length=255, unique=True)
+    vendor_name = models.CharField(max_length=500, unique=True)
     account_number = models.CharField(max_length=100, blank=True, null=True)  # Customer registered number at vendor
     items_supplied = models.TextField(blank=True, null=True)  # e.g., comma-separated list or JSON array
     category = models.CharField(max_length=255, blank=True, null=True)
